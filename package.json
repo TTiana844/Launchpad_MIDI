@@ -1,0 +1,10 @@
+{
+  "name": "launchpad-ulohy-ai-hodnotenie",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Odovzdávací systém pre 10 cvičení s Launchpad Mini a FL Studiom, s AI hodnotením cez Anthropic API (Vercel serverless funkcia).",
+  "scripts": {
+    "dev": "vercel dev"
+  }
+}
