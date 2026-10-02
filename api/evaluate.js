@@ -39,17 +39,40 @@ export default async function handler(req, res) {
       headers["anthropic-workspace-id"] = process.env.ANTHROPIC_WORKSPACE_ID;
     }
 
-    const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: model || "claude-haiku-4-5-20251001",
-        max_tokens: max_tokens || 2048,
-        system: system || undefined,
-        messages
-      })
-    });
+   // const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+     // method: "POST",
+     // headers,
+     // body: JSON.stringify({
+      //  model: model || "claude-haiku-4-5-20251001",
+      //  max_tokens: max_tokens || 2048,
+      //  system: system || undefined,
+       // messages
+      //})
+   // });
+// 1. Pripojenie pokynu pre stručnosť a platný JSON k vášmu systémovému promptu
+const conciseInstruction = "Odpovedaj VÝHRADNE v platnom JSON formáte. Všetky textové polia (ako strengths, improvements, summary) musia byť stručné (maximálne 2 až 3 vety na pole), aby odpoveď nepresiahla limit tokenov a JSON bol vždy kompletný a správne uzatvorený.";
 
+const finalSystemPrompt = system 
+  ? `${system}\n\n${conciseInstruction}` 
+  : conciseInstruction;
+
+// 2. Samotné volanie Anthropic API
+const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+  method: "POST",
+  headers,
+  body: JSON.stringify({
+    model: model || "claude-haiku-4-5-20251001",
+    max_tokens: max_tokens || 4096,
+    system: finalSystemPrompt,
+    messages
+  })
+});
+
+// 3. Ošetrenie prípadnej chyby z API
+if (!anthropicRes.ok) {
+  const errorData = await anthropicRes.json().catch(() => ({}));
+  throw new Error(`Anthropic API chyba (${anthropicRes.status}): ${errorData.error?.message || anthropicRes.statusText}`);
+}
     const data = await anthropicRes.json();
 
     if (!anthropicRes.ok) {
