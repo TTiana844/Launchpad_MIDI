@@ -1,75 +1,114 @@
-// /api/evaluate.js  (Launchpad)
+// /api/evaluate.js
 // Vercel Serverless Function (Node.js runtime).
-// Prijme z frontendu { model, max_tokens, system, messages } a bezpečne
-// zavolá Anthropic API pomocou kľúča uloženého v premennej prostredia
-// ANTHROPIC_API_KEY (nastavuje sa vo Vercel dashboarde, nie v kóde).
-// Kľúč sa vďaka tomu nikdy neposiela do prehliadača používateľa.
-//
-// Odolnosť voči orezaným odpovediam:
-//  - k systémovému promptu sa pripája pokyn na stručný, platný JSON,
-//  - predvolený limit výstupu je 2048 tokenov (slovenčina je "drahá" na tokeny),
-//  - ak model skončí so stop_reason "max_tokens", endpoint automaticky
-//    skúsi jeden retry s dvojnásobným limitom (max. MAX_TOKENS_CAP),
-//  - ak je odpoveď aj potom orezaná, vráti sa s príznakom `truncated: true`,
-//    aby frontend vedel spustiť lokálny fallback,
-//  - krátke opakovanie pri dočasných chybách (429, 5xx, 529).
+// 1) Overí odovzdanie (trieda, členovia) a zavolá Anthropic API kľúčom z ANTHROPIC_API_KEY.
+// 2) Hodnotenie spracuje a ULOŽÍ do databázy — žiak výsledok nemá kde upraviť,
+//    zapisuje len server.
+// 3) Ak AI zlyhá, uloží sa odovzdanie "čaká na ručné hodnotenie" (bez známky).
 
-const API_URL = "https://api.anthropic.com/v1/messages";
-const DEFAULT_MODEL = "claude-haiku-4-5-20251001";
-const DEFAULT_MAX_TOKENS = 2048;
-const MAX_TOKENS_CAP = 4096;
-const REQUEST_TIMEOUT_MS = 25000;
-const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 529]);
+import { dbConfigured, cmd, getActiveClass, PROJECT, subsKey } from "./_db.js";
 
-// Pokyn pripojený k systémovému promptu z frontendu.
-const CONCISE_INSTRUCTION =
-  "Odpovedaj VÝHRADNE v platnom JSON formáte, bez markdown blokov (bez ```) a bez textu mimo JSON. " +
-  "Všetky textové polia (ako strengths, improvements, summary) musia byť stručné " +
-  "(maximálne 2 až 3 vety na pole), aby odpoveď nepresiahla limit tokenov " +
-  "a JSON bol vždy kompletný a správne uzatvorený.";
+const TZ = "Europe/Bratislava";
+const EX_IDS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function stamp() {
+  const d = new Date();
+  return {
+    ts: d.getTime(),
+    time: d.toLocaleTimeString("sk-SK", { timeZone: TZ, hour: "2-digit", minute: "2-digit" }),
+    date: d.toLocaleDateString("sk-SK", { timeZone: TZ })
+  };
 }
 
-function clampMaxTokens(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_MAX_TOKENS;
-  return Math.min(Math.floor(n), MAX_TOKENS_CAP);
-}
+// Overí meta (trieda, cvičenie, členovia). Vracia { v } alebo { error, status }.
+async function resolveMeta(meta) {
+  if (!meta || typeof meta !== "object") return { error: "Chýbajú údaje o odovzdaní.", status: 400 };
+  const exId = String(meta.exId);
+  if (!EX_IDS.includes(exId)) return { error: "Neznáme cvičenie.", status: 400 };
 
-// Jedno volanie Anthropic API s timeoutom. Vracia { ok, status, data }.
-async function callAnthropic(headers, payload) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    const response = await fetch(API_URL, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
+  const cls = await getActiveClass();
+  if (!cls) return { error: "Učiteľ zatiaľ nenastavil aktívnu triedu.", status: 409 };
+  if (String(meta.classId) !== cls.id) {
+    return { error: "Trieda sa medzitým zmenila. Obnov stránku (F5) a vyber sa znova.", status: 409 };
+  }
 
-    let data;
-    try {
-      data = await response.json();
-    } catch {
-      data = { error: { message: "Anthropic API vrátilo odpoveď, ktorá nie je JSON." } };
+  const ids = Array.isArray(meta.members) ? [...new Set(meta.members.map(String))] : [];
+  if (ids.length < 1 || ids.length > 4) return { error: "Tím môže mať 1 až 4 členov.", status: 400 };
+  const byId = Object.fromEntries(cls.students.filter(s => s.name).map(s => [s.id, s]));
+  if (!ids.every(id => byId[id])) return { error: "Niektorý člen nie je v zozname triedy.", status: 400 };
+
+  // Odkaz na súbory na Google Drive je povinný (https://drive.google.com/…, docs.google.com/…)
+  const link = typeof meta.link === "string" ? meta.link.trim().slice(0, 300) : "";
+  if (!/^https:\/\/([a-z0-9-]+\.)*google\.com\//i.test(link)) {
+    return { error: "Vlož odkaz na svoje súbory na Google Drive (začína https://drive.google.com/…).", status: 400 };
+  }
+
+  // Roly členov tímu (voliteľné, napr. "bubeník") — len pre členov tímu, krátke texty
+  const roles = {};
+  if (meta.roles && typeof meta.roles === "object") {
+    for (const id of ids) {
+      const r = meta.roles[id];
+      if (typeof r === "string" && r.trim()) roles[id] = r.trim().slice(0, 30);
     }
-    return { ok: response.ok, status: response.status, data };
-  } finally {
-    clearTimeout(timer);
   }
+
+  return {
+    v: {
+      cls,
+      exId,
+      roles,
+      members: ids.sort(),
+      ckN: Number(meta.ckN) || 0,
+      ckT: Number(meta.ckT) || 0,
+      fc: Number(meta.fc) || 0,
+      comm: String(meta.comm ?? "").slice(0, 1200),
+      link
+    }
+  };
 }
 
-// Volanie s jedným opakovaním pri dočasných chybách.
-async function callWithRetry(headers, payload) {
-  let result = await callAnthropic(headers, payload);
-  if (!result.ok && RETRYABLE_STATUS.has(result.status)) {
-    await sleep(800);
-    result = await callAnthropic(headers, payload);
+async function saveAttempt(v, result, err) {
+  const attempt = {
+    ...stamp(),
+    ckN: v.ckN, ckT: v.ckT, fc: v.fc, comm: v.comm, link: v.link,
+    ...(err ? { err: String(err).slice(0, 160) } : {}),
+    ...(Object.keys(v.roles).length ? { roles: v.roles } : {}),
+    pending: !result,
+    ...(result || {})
+  };
+  const hash = subsKey(v.cls.id);
+  await cmd("SADD", "projects", PROJECT);
+  const key = `${v.exId}|${v.members.join("+")}`;
+  const cur = await cmd("HGET", hash, key);
+  const rec = cur ? JSON.parse(cur) : { exId: v.exId, members: v.members, attempts: [] };
+  rec.attempts.push(attempt);
+  if (rec.attempts.length > 10) rec.attempts = rec.attempts.slice(-10);
+  await cmd("HSET", hash, key, JSON.stringify(rec));
+  return attempt;
+}
+
+// Vráti { result } alebo { err } s dôvodom ("truncated" = odpoveď AI sa odrezala na
+// limite max_tokens, "bad_json" = AI nevrátila platný JSON).
+function parseAI(data) {
+  const txt = (data.content || []).map(b => b.text || "").join("").trim();
+  try {
+    let s = txt.replace(/```json|```/g, "").trim();
+    // AI niekedy pridá vetu pred/za JSON — vezmeme len objekt od prvej { po poslednú }
+    const a = s.indexOf("{"), b = s.lastIndexOf("}");
+    if (a >= 0 && b > a) s = s.slice(a, b + 1);
+    const p = JSON.parse(s);
+    return {
+      result: {
+        grade: Math.max(1, Math.min(5, parseInt(p.grade) || 3)),
+        total: Math.max(0, Math.min(100, parseInt(p.total) || 0)),
+        criteria: (p.criteria && typeof p.criteria === "object") ? p.criteria : {},
+        strengths: String(p.strengths || "Práca odovzdaná."),
+        improvements: String(p.improvements || "Doplň komentár."),
+        summary: String(p.summary || "Automatické hodnotenie.")
+      }
+    };
+  } catch {
+    return { err: data.stop_reason === "max_tokens" ? "truncated (max_tokens)" : "bad_json" };
   }
-  return result;
 }
 
 export default async function handler(req, res) {
@@ -86,81 +125,94 @@ export default async function handler(req, res) {
     return;
   }
 
-  // req.body môže prísť ako objekt alebo ako string (podľa Content-Type).
-  let body = req.body;
-  if (typeof body === "string") {
+  const { model, max_tokens, system, messages, meta } = req.body || {};
+  if (!messages) {
+    res.status(400).json({ error: "Chýba pole 'messages' v tele požiadavky." });
+    return;
+  }
+
+  const useDb = dbConfigured();
+  let v = null;
+  if (useDb) {
     try {
-      body = JSON.parse(body);
-    } catch {
-      res.status(400).json({ error: "Telo požiadavky nie je platný JSON." });
+      const m = await resolveMeta(meta);
+      if (m.error) {
+        res.status(m.status).json({ error: m.error });
+        return;
+      }
+      v = m.v;
+    } catch (e) {
+      res.status(500).json({ error: "Databáza nie je dostupná.", details: String(e.message || e) });
       return;
     }
   }
 
-  const { model, max_tokens, system, messages } = body || {};
-
-  if (!Array.isArray(messages) || messages.length === 0) {
-    res.status(400).json({ error: "Chýba pole 'messages' v tele požiadavky (musí byť neprázdne pole)." });
-    return;
-  }
-
-  const headers = {
-    "Content-Type": "application/json",
-    "x-api-key": apiKey,
-    "anthropic-version": "2023-06-01"
-  };
-  // Voliteľné: ak API kľúč funguje na viacerých workspace-och (identity-linked kľúč),
-  // Anthropic API vyžaduje aj túto hlavičku. Nastav ANTHROPIC_WORKSPACE_ID vo Vercel
-  // Environment Variables, ak dostávaš chybu "anthropic-workspace-id is required...".
-  if (process.env.ANTHROPIC_WORKSPACE_ID) {
-    headers["anthropic-workspace-id"] = process.env.ANTHROPIC_WORKSPACE_ID;
-  }
-
-  const payload = {
-    model: model || DEFAULT_MODEL,
-    max_tokens: clampMaxTokens(max_tokens),
-    system: system ? `${system}\n\n${CONCISE_INSTRUCTION}` : CONCISE_INSTRUCTION,
-    messages
+  // Zaznamená odovzdanie bez známky, aby ho učiteľ videl aj keď AI zlyhala.
+  const savePending = async (reason) => {
+    if (!v) return false;
+    try { await saveAttempt(v, null, reason); return true; } catch { return false; }
   };
 
   try {
-    let result = await callWithRetry(headers, payload);
-
-    // Odpoveď orezaná na max_tokens -> jeden retry s vyšším limitom.
-    if (
-      result.ok &&
-      result.data?.stop_reason === "max_tokens" &&
-      payload.max_tokens < MAX_TOKENS_CAP
-    ) {
-      const retryPayload = {
-        ...payload,
-        max_tokens: Math.min(payload.max_tokens * 2, MAX_TOKENS_CAP)
-      };
-      const retryResult = await callWithRetry(headers, retryPayload);
-      if (retryResult.ok) {
-        result = retryResult;
-      }
+    const headers = {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01"
+    };
+    // Voliteľné: ak API kľúč funguje na viacerých workspace-och (identity-linked kľúč),
+    // Anthropic API vyžaduje aj túto hlavičku (ANTHROPIC_WORKSPACE_ID vo Vercel Environment Variables).
+    if (process.env.ANTHROPIC_WORKSPACE_ID) {
+      headers["anthropic-workspace-id"] = process.env.ANTHROPIC_WORKSPACE_ID;
     }
 
-    if (!result.ok) {
-      res.status(result.status).json({
-        error: result.data?.error?.message || "Chyba pri volaní Anthropic API.",
-        details: result.data
+    const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: model || "claude-haiku-4-5-20251001",
+        max_tokens: max_tokens || 600,
+        system: system || undefined,
+        messages
+      })
+    });
+
+    const data = await anthropicRes.json();
+
+    if (!anthropicRes.ok) {
+      const msg = data?.error?.message || "Chyba pri volaní Anthropic API.";
+      const savedPending = await savePending(`api ${anthropicRes.status}: ${msg}`);
+      res.status(anthropicRes.status).json({
+        error: msg,
+        details: data,
+        savedPending
       });
       return;
     }
 
-    // Ak je odpoveď stále orezaná, frontend to vie z tohto príznaku
-    // a môže prepnúť na lokálny fallback.
-    const truncated = result.data?.stop_reason === "max_tokens";
-    res.status(200).json({ ...result.data, truncated });
+    const parsed = parseAI(data);
+    const result = parsed.result;
+    if (!result) {
+      const savedPending = await savePending(parsed.err);
+      res.status(502).json({ error: "Odpoveď AI sa nedala spracovať.", reason: parsed.err, savedPending });
+      return;
+    }
+
+    if (!v) {
+      // Databáza nie je nastavená — hodnotenie sa vráti, ale neuloží
+      res.status(200).json({ ...data, saved: false, reason: "no_db", record: result });
+      return;
+    }
+
+    let attempt;
+    try {
+      attempt = await saveAttempt(v, result);
+    } catch (e) {
+      res.status(200).json({ ...data, saved: false, reason: "db_error", record: result });
+      return;
+    }
+    res.status(200).json({ ...data, saved: true, record: attempt });
   } catch (err) {
-    const timedOut = err?.name === "AbortError";
-    res.status(timedOut ? 504 : 500).json({
-      error: timedOut
-        ? "Anthropic API neodpovedalo včas."
-        : "Nepodarilo sa spojiť s Anthropic API.",
-      details: String(err)
-    });
+    const savedPending = await savePending("network: " + String(err).slice(0, 100));
+    res.status(500).json({ error: "Nepodarilo sa spojiť s Anthropic API.", details: String(err), savedPending });
   }
 }
