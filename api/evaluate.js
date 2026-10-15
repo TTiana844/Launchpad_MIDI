@@ -8,6 +8,8 @@
 import { dbConfigured, cmd, getActiveClass, PROJECT, subsKey } from "./_db.js";
 
 const TZ = "Europe/Bratislava";
+const MIN_TOKENS = 2500;      // minimum max_tokens pre hodnotenie
+const RETRY_TOKENS = 4000;    // pri opakovaní po odrezanej/nečitateľnej odpovedi
 const EX_IDS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
 
 function stamp() {
@@ -86,29 +88,104 @@ async function saveAttempt(v, result, err) {
   return attempt;
 }
 
-// Vráti { result } alebo { err } s dôvodom ("truncated" = odpoveď AI sa odrezala na
-// limite max_tokens, "bad_json" = AI nevrátila platný JSON).
-function parseAI(data) {
-  const txt = (data.content || []).map(b => b.text || "").join("").trim();
-  try {
-    let s = txt.replace(/```json|```/g, "").trim();
-    // AI niekedy pridá vetu pred/za JSON — vezmeme len objekt od prvej { po poslednú }
-    const a = s.indexOf("{"), b = s.lastIndexOf("}");
-    if (a >= 0 && b > a) s = s.slice(a, b + 1);
-    const p = JSON.parse(s);
-    return {
-      result: {
-        grade: Math.max(1, Math.min(5, parseInt(p.grade) || 3)),
-        total: Math.max(0, Math.min(100, parseInt(p.total) || 0)),
-        criteria: (p.criteria && typeof p.criteria === "object") ? p.criteria : {},
-        strengths: String(p.strengths || "Práca odovzdaná."),
-        improvements: String(p.improvements || "Doplň komentár."),
-        summary: String(p.summary || "Automatické hodnotenie.")
-      }
-    };
-  } catch {
-    return { err: data.stop_reason === "max_tokens" ? "truncated (max_tokens)" : "bad_json" };
+// Nástroj, ktorým AI vracia hodnotenie. Pri vynútenom tool_choice vráti API hotový
+// objekt (nie text), takže odpadá chyba "bad_json" (nezakončené/neescapované úvodzovky).
+// Kritériá sa líšia podľa cvičenia (kľúče a maximá posiela appka v poli "criteria"),
+// preto sa schéma skladá dynamicky; ak ich appka nepošle, použije sa všeobecná schéma.
+function sanitizeCriteria(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const c of list.slice(0, 12)) {
+    const k = c && typeof c.k === "string" ? c.k : "";
+    const m = Math.round(Number(c && c.m));
+    if (!/^[a-zA-Z0-9_-]{1,20}$/.test(k) || !(m >= 1 && m <= 100)) return null;
+    out.push({ k, m });
   }
+  return out.length ? out : null;
+}
+
+function buildEvalTool(criteriaSpec) {
+  const spec = sanitizeCriteria(criteriaSpec);
+  const criteria = spec
+    ? {
+        type: "object",
+        properties: Object.fromEntries(spec.map(c => [c.k, { type: "integer", minimum: 0, maximum: c.m }])),
+        required: spec.map(c => c.k)
+      }
+    : { type: "object", additionalProperties: { type: "integer", minimum: 0, maximum: 100 } };
+  return {
+    name: "submit_evaluation",
+    description: "Odošle hotové hodnotenie žiackeho odovzdania.",
+    input_schema: {
+      type: "object",
+      properties: {
+        grade: { type: "integer", minimum: 1, maximum: 5, description: "Známka 1 (výborný) až 5 (nedostatočný)" },
+        total: { type: "integer", minimum: 0, maximum: 100, description: "Celkové skóre v percentách" },
+        criteria,
+        strengths: { type: "string", description: "Silné stránky, stručne (max. cca 80 slov)" },
+        improvements: { type: "string", description: "Odporúčania na zlepšenie, stručne (max. cca 100 slov)" },
+        summary: { type: "string", description: "Celkové zhrnutie, 2–3 vety" }
+      },
+      required: ["grade", "total", "criteria", "strengths", "improvements", "summary"]
+    }
+  };
+}
+
+function normalize(p) {
+  return {
+    grade: Math.max(1, Math.min(5, parseInt(p.grade) || 3)),
+    total: Math.max(0, Math.min(100, parseInt(p.total) || 0)),
+    criteria: (p.criteria && typeof p.criteria === "object")
+      ? Object.fromEntries(Object.entries(p.criteria).map(([k, v]) => [k, Math.max(0, parseInt(v) || 0)]))
+      : {},
+    strengths: String(p.strengths || "Práca odovzdaná."),
+    improvements: String(p.improvements || "Doplň komentár."),
+    summary: String(p.summary || "Automatické hodnotenie.")
+  };
+}
+
+// Vráti { result } alebo { err } s dôvodom ("truncated" = odpoveď AI sa odrezala na
+// limite max_tokens, "bad_json" = AI nevrátila platný JSON, "no_output" = prázdna odpoveď).
+function parseAI(data) {
+  const blocks = Array.isArray(data.content) ? data.content : [];
+
+  // 1) Preferovaná cesta: tool_use (hotový objekt)
+  const tool = blocks.find(b => b && b.type === "tool_use" && b.input && typeof b.input === "object");
+  if (tool && data.stop_reason !== "max_tokens") {
+    return { result: normalize(tool.input) };
+  }
+  if (data.stop_reason === "max_tokens") return { err: "truncated (max_tokens)" };
+
+  // 2) Záloha: text s JSON-om
+  const txt = blocks.map(b => b.text || "").join("").trim();
+  if (!txt) return { err: "no_output" };
+  try {
+    let t = txt.replace(/```json|```/g, "").trim();
+    const a = t.indexOf("{"), b = t.lastIndexOf("}");
+    if (a >= 0 && b > a) t = t.slice(a, b + 1);
+    return { result: normalize(JSON.parse(t)) };
+  } catch {
+    return { err: "bad_json" };
+  }
+}
+
+// Zavolá Anthropic API. Vracia { res, data } (res = fetch odpoveď).
+async function callAnthropic(headers, { model, max_tokens, system, messages, tool }) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: model || "claude-haiku-4-5-20251001",
+      // Dolná hranica: slovenčina je „drahá“ na tokeny a odpoveď má ~6 polí textu
+      max_tokens: Math.max(Number(max_tokens) || 0, MIN_TOKENS),
+      system: system || undefined,
+      messages,
+      tools: [tool],
+      tool_choice: { type: "tool", name: tool.name }
+    })
+  });
+  const data = await res.json().catch(() => ({}));
+  return { res, data };
 }
 
 export default async function handler(req, res) {
@@ -125,7 +202,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  const { model, max_tokens, system, messages, meta } = req.body || {};
+  const { model, max_tokens, system, messages, meta, criteria } = req.body || {};
   if (!messages) {
     res.status(400).json({ error: "Chýba pole 'messages' v tele požiadavky." });
     return;
@@ -165,18 +242,14 @@ export default async function handler(req, res) {
       headers["anthropic-workspace-id"] = process.env.ANTHROPIC_WORKSPACE_ID;
     }
 
-    const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: model || "claude-haiku-4-5-20251001",
-        max_tokens: max_tokens || 600,
-        system: system || undefined,
-        messages
-      })
-    });
+    const tool = buildEvalTool(criteria);
+    let { res: anthropicRes, data } = await callAnthropic(headers, { model, max_tokens, system, messages, tool });
 
-    const data = await anthropicRes.json();
+    // Dočasné preťaženie / chyba servera Anthropicu (429, 5xx, 529) — jedno opakovanie
+    if (!anthropicRes.ok && [429, 500, 502, 503, 529].includes(anthropicRes.status)) {
+      await new Promise(r => setTimeout(r, 1500));
+      ({ res: anthropicRes, data } = await callAnthropic(headers, { model, max_tokens, system, messages, tool }));
+    }
 
     if (!anthropicRes.ok) {
       const msg = data?.error?.message || "Chyba pri volaní Anthropic API.";
@@ -189,7 +262,13 @@ export default async function handler(req, res) {
       return;
     }
 
-    const parsed = parseAI(data);
+    let parsed = parseAI(data);
+    // Odrezaná alebo nečitateľná odpoveď — jedno opakovanie s väčším limitom
+    if (!parsed.result) {
+      const again = await callAnthropic(headers, { model, max_tokens: RETRY_TOKENS, system, messages, tool });
+      if (again.res.ok) parsed = parseAI(again.data);
+      if (parsed.result) data = again.data;
+    }
     const result = parsed.result;
     if (!result) {
       const savedPending = await savePending(parsed.err);
