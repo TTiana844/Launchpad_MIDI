@@ -520,14 +520,17 @@ const LS_KEY='launchpadState';
 function loadState(){
   try{
     const raw=localStorage.getItem(LS_KEY);
-    if(raw){const parsed=JSON.parse(raw);return Object.assign({sel:null,mode:{},members:{},checked:{},uploads:{},comment:{},link:{},subs:[],result:null,tutOpen:{}},parsed,{result:null,members:{},cfg:null});}
+    if(raw){const parsed=JSON.parse(raw);
+      Object.values(parsed.uploads||{}).forEach(arr=>(arr||[]).forEach(f=>{if(f.kind==='image'&&!f.base64)f.kind='image-lost';}));
+      return Object.assign({sel:null,mode:{},members:{},checked:{},uploads:{},comment:{},link:{},subs:[],result:null,tutOpen:{}},parsed,{result:null,members:{},cfg:null});}
   }catch(e){console.warn('Nepodarilo sa načítať uložený stav:',e);}
   return {sel:null,mode:{},members:{},checked:{},uploads:{},comment:{},link:{},subs:[],result:null,tutOpen:{},cfg:null};
 }
 let S=loadState();
 function persist(){
   try{
-    const toSave={mode:S.mode,checked:S.checked,uploads:S.uploads,comment:S.comment,link:S.link,subs:S.subs,tutOpen:S.tutOpen};
+    const uploadsLite=Object.fromEntries(Object.entries(S.uploads).map(([k,arr])=>[k,(arr||[]).map(({base64,...rest})=>rest)]));
+    const toSave={mode:S.mode,checked:S.checked,uploads:uploadsLite,comment:S.comment,link:S.link,subs:S.subs,tutOpen:S.tutOpen};
     localStorage.setItem(LS_KEY,JSON.stringify(toSave));
   }catch(e){console.warn('Nepodarilo sa uložiť stav (localStorage plné alebo nedostupné):',e);}
 }
@@ -696,7 +699,7 @@ function renderMain(){
           <div class="shot-req-h"><i class="ti ti-camera" aria-hidden="true"></i>Požiadavky na screenshoty, aby ich AI vedela reálne vyhodnotiť</div>
           <ul>
             <li><strong>Formát:</strong> .png, .jpg, .jpeg, .webp alebo .gif — <strong>nie .HEIC</strong> (bežné pri fotkách z iPhonu). Ak fotíš mobilom, over si formát .jpg, alebo radšej screenshot priamo z počítača.</li>
-            <li><strong>Veľkosť:</strong> do 4 MB na obrázok (nad tento limit ho appka AI nepošle, len zaznamená názov súboru).</li>
+            <li><strong>Veľkosť:</strong> obrázok môže mať aj niekoľko MB — appka ho pred odoslaním sama zmenší (na max. 1600 px), takže text na screenshote zostane čitateľný. Nad 25 MB ho appka nenačíta.</li>
             <li><strong>Ostrosť:</strong> žiadne rozmazané fotky obrazovky spod uhla — nastavenia (CC čísla, mapovania, farby padov) musia byť jasne čitateľné.</li>
             <li><strong>Čo má byť vidno pre toto cvičenie:</strong> ${ex.kw.slice(0,6).join(', ')}.</li>
             <li>Video/audio súbory (.mp4/.wav/.mp3/.mid) AI obsahovo <strong>nevie</strong> prehrať — slúžia len ako formálny dôkaz existencie, rozhodujúci je aj konkrétny komentár nižšie.</li>
@@ -706,7 +709,7 @@ function renderMain(){
         <div class="upload-zone" onclick="document.getElementById('file-input-${ex.id}').click()" role="button" tabindex="0" aria-label="Priložiť súbory">
           <i class="ti ti-upload uz-icon" aria-hidden="true"></i>
           <div class="uz-t">Klikni pre pridanie súborov</div>
-          <div class="uz-h">PNG · JPG · WAV · MP3 · MP4 · MID · obrázky do 4 MB, ostatné do 20 MB</div>
+          <div class="uz-h">PNG · JPG · WAV · MP3 · MP4 · MID · obrázky do 25 MB (appka ich zmenší), ostatné do 20 MB</div>
           <input type="file" id="file-input-${ex.id}" multiple style="display:none;" onchange="handleFiles(${ex.id},this)">
         </div>
         ${chips?`<div class="chips">${chips}</div>`:''}
@@ -742,7 +745,13 @@ function closeExample(){document.getElementById('example-modal').classList.remov
 // Správa súborov — skutočné čítanie obrázkov (base64) na odoslanie AI
 // ============================================================
 const SUPPORTED_IMAGE_EXT=['png','jpg','jpeg','webp','gif'];
-const MAX_IMAGE_BYTES=4*1024*1024;
+const MAX_SOURCE_BYTES=25*1024*1024;   // pôvodný súbor; pred odoslaním sa zmenší
+const KEEP_AS_IS_BYTES=350*1024;       // malé obrázky (do 1600 px) sa neprekódujú
+const TOTAL_IMAGE_BUDGET=3000000;      // spolu max. ~3 MB base64 na odovzdanie (Vercel: telo požiadavky max 4,5 MB)
+const PER_IMAGE_MAX=1500000;           // jeden obrázok max. ~1,5 MB base64
+// Postupne agresívnejšie zmenšovanie, kým sa obrázok nezmestí do rozpočtu
+const SHRINK_STEPS=[{side:1600,q:0.82},{side:1400,q:0.74},{side:1200,q:0.68},{side:1000,q:0.60},{side:800,q:0.55}];
+
 function readFileAsBase64(file){
   return new Promise((resolve,reject)=>{
     const reader=new FileReader();
@@ -751,11 +760,56 @@ function readFileAsBase64(file){
     reader.readAsDataURL(file);
   });
 }
+function loadViaImg(file){
+  return new Promise((resolve,reject)=>{
+    const url=URL.createObjectURL(file);
+    const img=new Image();
+    img.onload=()=>{URL.revokeObjectURL(url);resolve(img);};
+    img.onerror=()=>{URL.revokeObjectURL(url);reject(new Error('image load failed'));};
+    img.src=url;
+  });
+}
+// Načíta obrázok (s ohľadom na otočenie z EXIF, ak to prehliadač vie)
+function loadBitmap(file){
+  if(window.createImageBitmap){
+    return createImageBitmap(file,{imageOrientation:'from-image'}).catch(()=>loadViaImg(file));
+  }
+  return loadViaImg(file);
+}
+// Vykreslí obrázok zmenšený na max. maxSide px a vráti JPEG ako base64 (bez prefixu)
+function renderJpeg(bmp,maxSide,quality){
+  const w0=bmp.naturalWidth||bmp.width,h0=bmp.naturalHeight||bmp.height;
+  const scale=Math.min(1,maxSide/Math.max(w0,h0));
+  const w=Math.max(1,Math.round(w0*scale)),h=Math.max(1,Math.round(h0*scale));
+  const c=document.createElement('canvas');
+  c.width=w;c.height=h;
+  const ctx=c.getContext('2d');
+  ctx.fillStyle='#fff';              // priehľadné PNG -> biele pozadie (JPEG priehľadnosť nemá)
+  ctx.fillRect(0,0,w,h);
+  ctx.imageSmoothingQuality='high';
+  ctx.drawImage(bmp,0,0,w,h);
+  const url=c.toDataURL('image/jpeg',quality);
+  return url.includes(',')?url.split(',')[1]:'';
+}
+// Vyberie prvé nastavenie, ktoré sa zmestí do budgetChars; null = nezmestí sa ani najmenšie
+function pickShrink(bmp,budgetChars){
+  for(const st of SHRINK_STEPS){
+    const b64=renderJpeg(bmp,st.side,st.q);
+    if(b64&&b64.length<=budgetChars)return b64;
+  }
+  return null;
+}
+function mimeFor(file,ext){
+  if(file.type)return file.type;
+  return ext==='jpg'||ext==='jpeg'?'image/jpeg':`image/${ext}`;
+}
 function fileKindLabel(f){
   switch(f.kind){
-    case 'image': return 'obrázok — AI ho reálne uvidí';
+    case 'image': return f.shrunk?`obrázok — AI ho reálne uvidí (zmenšený na ${f.sentKb} KB)`:'obrázok — AI ho reálne uvidí';
+    case 'image-lost': return 'obrázok sa po obnovení stránky neuchoval — prilož ho znova, aby ho AI videla';
     case 'heic-unsupported': return 'HEIC nie je podporovaný — prekonvertuj na JPG/PNG';
-    case 'image-too-large': return 'obrázok je príliš veľký na analýzu';
+    case 'image-over-limit': return 'priložených obrázkov je spolu príliš veľa na odoslanie — odstráň niektorý a pridaj tento znova';
+    case 'image-too-large': return 'obrázok má nad 25 MB — zmenši ho alebo urob nový screenshot';
     case 'unreadable': return 'súbor sa nepodarilo načítať';
     default: return 'video/audio/iný súbor — obsah sa neanalyzuje, len sa zaznamená názov';
   }
@@ -770,12 +824,33 @@ async function handleFiles(id,input){
     const sizeStr=(f.size/(1024*1024)).toFixed(2)+' MB';
     const isSupportedImg=SUPPORTED_IMAGE_EXT.includes(ext);
     const isHeic=ext==='heic'||ext==='heif';
-    if(isSupportedImg&&f.size<=MAX_IMAGE_BYTES){
+    if(isSupportedImg&&f.size<=MAX_SOURCE_BYTES){
+      let bmp=null;
       try{
-        const base64=await readFileAsBase64(f);
-        const mime=f.type||(ext==='jpg'?'image/jpeg':`image/${ext}`);
-        S.uploads[id].push({name:f.name,size:sizeStr,kind:'image',mime,base64});
-      }catch(e){S.uploads[id].push({name:f.name,size:sizeStr,kind:'unreadable'});}
+        const used=S.uploads[id].reduce((n,x)=>n+(x.base64?x.base64.length:0),0);
+        const budget=Math.min(PER_IMAGE_MAX,TOTAL_IMAGE_BUDGET-used);
+        bmp=await loadBitmap(f);
+        const maxDim=Math.max(bmp.naturalWidth||bmp.width,bmp.naturalHeight||bmp.height);
+        let base64=null,mime='image/jpeg',shrunk=false;
+        if(f.size<=KEEP_AS_IS_BYTES&&maxDim<=SHRINK_STEPS[0].side){
+          const orig=await readFileAsBase64(f);
+          if(orig.length<=budget){base64=orig;mime=mimeFor(f,ext);}
+        }
+        if(!base64){
+          base64=budget>0?pickShrink(bmp,budget):null;
+          shrunk=!!base64;
+        }
+        if(base64){
+          S.uploads[id].push({name:f.name,size:sizeStr,kind:'image',mime,base64,sentKb:Math.round(base64.length*0.75/1024),shrunk});
+        }else{
+          S.uploads[id].push({name:f.name,size:sizeStr,kind:'image-over-limit'});
+        }
+      }catch(e){
+        console.warn('Obrázok sa nepodarilo spracovať:',f.name,e);
+        S.uploads[id].push({name:f.name,size:sizeStr,kind:'unreadable'});
+      }finally{
+        if(bmp&&bmp.close)bmp.close();
+      }
     }else if(isHeic){
       S.uploads[id].push({name:f.name,size:sizeStr,kind:'heic-unsupported'});
     }else if(isSupportedImg){
@@ -859,8 +934,7 @@ ZÁKLADNÉ PRAVIDLÁ HODNOTENIA:
 
   const sysVariable=`${isTeam?'Ide o tímovú prácu – zohľadni aj spoluprácu, nielen technické zvládnutie Launchpadu.':'Ide o individuálnu prácu – hodnoť samostatné zvládnutie ovládača a MIDI konceptov.'}
 
-Odpovedaj VÝHRADNE platným JSON (bez backticks, bez iného textu):
-{"grade":1,"total":85,"criteria":{"${ex.criteria.map(c=>c.k).join('":0,"')}":0},"strengths":"...","improvements":"...","summary":"..."}
+Hodnotenie odošli VÝHRADNE cez nástroj submit_evaluation (žiadny voľný text).
 grade 1–5 (1=výborný, 5=nedostatočný), total 0–100, kritériá vyjadruj ako body z ich maxima: ${ex.criteria.map(c=>`"${c.k}" max ${c.m}`).join(', ')}.`;
 
   const sys=[
@@ -889,7 +963,7 @@ Over prosím, či je komentár a checklist žiaka reálne podložený, a hodnoť
   let saveStatus='failed';  // saved | nodb | pending | failed
   let p;
   try{
-    const r=await fetch("/api/evaluate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:1500,system:sys,messages:[{role:"user",content:userContent}],meta})});
+    const r=await fetch("/api/evaluate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:1500,system:sys,messages:[{role:"user",content:userContent}],meta,criteria:ex.criteria.map(c=>({k:c.k,m:c.m}))})});
     if(!r.ok){
       const eb=await r.json().catch(()=>({}));
       if(r.status===400||r.status===409){
