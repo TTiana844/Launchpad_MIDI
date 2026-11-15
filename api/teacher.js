@@ -3,7 +3,7 @@
 // Jedna funkcia, viac akcií: { action, password, ... }
 
 import { createHash, timingSafeEqual } from "node:crypto";
-import { dbConfigured, cmd, hgetall, getJSON, setJSON, PROJECT, subsKey, ovrKey } from "./_db.js";
+import { dbConfigured, cmd, hgetall, getJSON, setJSON, PROJECT, subsKey, ovrKey, ensureCode } from "./_db.js";
 
 const EX_IDS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
 const MAX_STUDENTS = 40;
@@ -56,7 +56,7 @@ export default async function handler(req, res) {
         const classes = [];
         for (const id of ids) {
           const c = await getJSON(`class:${id}`);
-          if (c) classes.push({ id: c.id, name: c.name, count: c.students.filter(s => s.name).length, createdAt: c.createdAt });
+          if (c) { await ensureCode(c); classes.push({ id: c.id, name: c.name, code: c.code, count: c.students.filter(s => s.name).length, createdAt: c.createdAt }); }
         }
         classes.sort((a, b) => b.createdAt - a.createdAt);
         const activeId = await cmd("GET", "cfg:active");
@@ -70,6 +70,7 @@ export default async function handler(req, res) {
           res.status(404).json({ error: "Trieda neexistuje." });
           return;
         }
+        await ensureCode(cls);
         const subs = Object.entries(parseValues(await hgetall(subsKey(wanted)))).map(([key, rec]) => ({ key, ...rec }));
         const ovr = parseValues(await hgetall(ovrKey(wanted)));
         res.status(200).json({ project: PROJECT, projects, classes, activeId, cls, subs, ovr });
@@ -89,18 +90,33 @@ export default async function handler(req, res) {
 
         let id = body.id;
         let createdAt = Date.now();
+        let oldCode;
         if (id) {
           if (!okClassId(id)) { res.status(400).json({ error: "Neplatné id triedy." }); return; }
           const old = await getJSON(`class:${id}`);
           if (!old) { res.status(404).json({ error: "Trieda neexistuje." }); return; }
           createdAt = old.createdAt;
+          oldCode = old.code;
         } else {
           id = "c" + Date.now().toString(36);
         }
-        await setJSON(`class:${id}`, { id, name, students, createdAt });
+        const obj = { id, name, students, createdAt, ...(oldCode ? { code: oldCode } : {}) };
+        await setJSON(`class:${id}`, obj);
         await cmd("SADD", "classes", id);
+        await ensureCode(obj);
         if (!body.id && body.setActive !== false) await cmd("SET", "cfg:active", id);
         res.status(200).json({ ok: true, id });
+        return;
+      }
+
+      case "newCode": {
+        if (!okClassId(body.classId)) { res.status(400).json({ error: "Neplatné id triedy." }); return; }
+        const cls = await getJSON(`class:${body.classId}`);
+        if (!cls) { res.status(404).json({ error: "Trieda neexistuje." }); return; }
+        if (cls.code) await cmd("DEL", `classcode:${cls.code}`);
+        delete cls.code;
+        await ensureCode(cls);
+        res.status(200).json({ ok: true, code: cls.code });
         return;
       }
 
@@ -117,7 +133,9 @@ export default async function handler(req, res) {
         if (!okClassId(body.classId)) { res.status(400).json({ error: "Neplatné id triedy." }); return; }
         // Zmaže triedu a jej odovzdania/ručné známky vo VŠETKÝCH projektoch zdieľajúcich databázu
         const projs = (await cmd("SMEMBERS", "projects")) || [];
+        const old = await getJSON(`class:${body.classId}`);
         const keys = [`class:${body.classId}`];
+        if (old && old.code) keys.push(`classcode:${old.code}`);
         for (const pr of new Set([...projs, PROJECT])) keys.push(`subs:${pr}:${body.classId}`, `ovr:${pr}:${body.classId}`);
         await cmd("DEL", ...keys);
         await cmd("SREM", "classes", body.classId);

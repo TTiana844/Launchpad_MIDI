@@ -55,3 +55,33 @@ export async function getActiveClass() {
   const id = await cmd("GET", "cfg:active");
   return id ? await getJSON(`class:${id}`) : null;
 }
+
+// --- Kód triedy: žiak zadá krátky kód a uvidí len zoznam svojej triedy ---
+// Kľúč  classcode:<KÓD> -> id triedy. Kód je uložený aj v class:<id> (pole "code").
+export const normCode = c => String(c || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12);
+const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // bez 0/O, 1/I
+export const genCode = () => Array.from({ length: 5 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join("");
+
+export async function getClassByCode(code) {
+  const c = normCode(code);
+  if (!c) return null;
+  const id = await cmd("GET", `classcode:${c}`);
+  return id ? await getJSON(`class:${id}`) : null;
+}
+
+// Triede bez kódu (staršie) pridelí nový, unikátny kód. Vracia triedu s poľom code.
+export async function ensureCode(cls) {
+  if (cls.code) {
+    await cmd("SET", `classcode:${cls.code}`, cls.id); // istota, že mapovanie existuje
+    return cls;
+  }
+  for (let i = 0; i < 25; i++) {
+    const c = genCode();
+    if (Number(await cmd("SETNX", `classcode:${c}`, cls.id)) === 1) {
+      cls.code = c;
+      await setJSON(`class:${cls.id}`, cls);
+      return cls;
+    }
+  }
+  throw new Error("Nepodarilo sa vytvoriť kód triedy.");
+}
