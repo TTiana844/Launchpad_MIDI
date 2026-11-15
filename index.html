@@ -370,7 +370,7 @@ body{font-family:var(--font-sans);color:var(--color-text-primary)}
 </div>
 
 <div id="panel-start" class="panel active"><div class="st-wrap" id="st-root"></div></div>
-<div id="panel-student" class="panel">
+<div id="panel-student" class="panel"><div id="cls-gate"></div>
   <div class="two-col">
     <div>
       <div class="slab">Cvičenia</div>
@@ -595,17 +595,47 @@ function selEx(id){
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 
 // Aktívna trieda a zoznam mien (verejné, bez hesla)
+function lpCode(){
+  let c='';
+  try{
+    const q=new URLSearchParams(location.search).get('trieda');
+    if(q){localStorage.setItem('lp_code',q);history.replaceState(null,'',location.pathname);}
+    c=localStorage.getItem('lp_code')||'';
+  }catch(e){}
+  return c.toUpperCase().replace(/[^A-Z0-9]/g,'');
+}
 async function loadConfig(){
-  try{const r=await fetch('/api/config',{cache:'no-store'});S.cfg=await r.json();}
-  catch(e){S.cfg={ok:false,reason:'offline'};}
+  const c=lpCode();
+  if(!c){S.cfg={ok:false,reason:'need_code'};}
+  else{
+    try{
+      const r=await fetch('/api/config?code='+encodeURIComponent(c),{cache:'no-store'});S.cfg=await r.json();
+      if(!S.cfg.ok&&S.cfg.reason==='bad_code'){try{localStorage.removeItem('lp_code')}catch(e){}}
+    }catch(e){S.cfg={ok:false,reason:'offline'};}
+  }
+  renderGate();
   if(S.sel)renderMain();
 }
+function enterCode(){
+  const v=((document.getElementById('lp-code')||{}).value||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+  if(!v)return;
+  try{localStorage.setItem('lp_code',v);}catch(e){}
+  S.cfg=null;renderGate();loadConfig();
+}
+function changeClass(){
+  try{localStorage.removeItem('lp_code');}catch(e){}
+  S.cfg={ok:false,reason:'need_code'};renderGate();if(S.sel)renderMain();
+}
+function renderGate(){const g=document.getElementById('cls-gate');if(g)g.innerHTML=cfgBannerHtml();}
 function studentById(sid){return (S.cfg&&S.cfg.cls?S.cfg.cls.students:[]).find(s=>s.id===sid)||null;}
 function cfgBannerHtml(){
   if(!S.cfg)return`<div class="infobanner ib-purple"><div class="infobanner-icon"><i class="ti ti-loader" aria-hidden="true"></i></div><div class="infobanner-body">Načítavam zoznam triedy…</div></div>`;
-  if(S.cfg.ok)return'';
-  const msg=S.cfg.reason==='no_class'?'Učiteľ zatiaľ nenastavil triedu — odovzdávanie bude možné, až keď ju vytvorí.'
-    :S.cfg.reason==='no_db'?'Server nemá pripojenú databázu — odovzdanie sa neuloží u učiteľa. Povedz to učiteľovi.'
+  if(S.cfg.ok)return`<div style="font-size:12px;color:var(--color-text-secondary);margin-bottom:10px;">Trieda: <strong>${esc(S.cfg.cls.name)}</strong> · <a href="#" onclick="changeClass();return false;">zmeniť triedu</a></div>`;
+  if(S.cfg.reason==='need_code'||S.cfg.reason==='bad_code'){
+    const bad=S.cfg.reason==='bad_code'?`<div style="color:#791F1F;margin-top:4px;">Kód sa nenašiel. Skontroluj ho a skús znova.</div>`:'';
+    return`<div class="infobanner ib-purple" style="margin-bottom:12px;"><div class="infobanner-icon"><i class="ti ti-key" aria-hidden="true"></i></div><div class="infobanner-body"><strong>Zadaj kód triedy</strong> (dostaneš ho od učiteľa). Uvidíš len zoznam svojej triedy.${bad}<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;"><input id="lp-code" type="text" maxlength="12" placeholder="napr. K7M4Q" autocomplete="off" style="text-transform:uppercase;width:150px;" onkeydown="if(event.key==='Enter')enterCode()"><button class="btn-p" type="button" onclick="enterCode()">Vstúpiť</button></div></div></div>`;
+  }
+  const msg=S.cfg.reason==='no_db'?'Server nemá pripojenú databázu — odovzdanie sa neuloží u učiteľa. Povedz to učiteľovi.'
     :'Nepodarilo sa načítať zoznam triedy. Skontroluj pripojenie a obnov stránku.';
   return`<div class="infobanner ib-amber"><div class="infobanner-icon"><i class="ti ti-alert-triangle" aria-hidden="true"></i></div><div class="infobanner-body">${msg}</div></div>`;
 }
@@ -684,7 +714,7 @@ function renderMain(){
       <select onchange="setSid(${ex.id},0,this.value)">${rosterOptionsHtml(mbrs[0]&&mbrs[0].sid,[])}</select>
     </div>`;
   }
-  membersH=cfgBannerHtml()+membersH;
+  
 
   const chkH=ex.checklist.map((item,i)=>{const c=ck[i]?'ck':'';return`<div class="ck-item ${c}" onclick="togCk(${ex.id},${i})">
     <input type="checkbox" ${ck[i]?'checked':''} onclick="event.stopPropagation();togCk(${ex.id},${i})" aria-label="${item}">
@@ -913,7 +943,7 @@ Over prosím, či je komentár a checklist žiaka reálne podložený, a hodnoť
   });
 
   const roles={};if(isTeam)rows.forEach(m=>{if(m.role)roles[m.sid]=m.role;});
-  const meta={classId:S.cfg.cls.id,exId:id,members:sids,roles,ckN,ckT:ex.checklist.length,fc:ups.length,comm:comment,link:(S.link[id]||'').trim()};
+  const meta={classId:S.cfg.cls.id,code:S.cfg.cls.code,exId:id,members:sids,roles,ckN,ckT:ex.checklist.length,fc:ups.length,comm:comment,link:(S.link[id]||'').trim()};
   let saveStatus='failed';  // saved | nodb | pending | failed
   let p;
   try{
@@ -1073,7 +1103,7 @@ function renderTeacher(){
       <button class="btn-s" type="button" onclick="loadTeacher()"><i class="ti ti-refresh"></i> Obnoviť</button>
       <button class="btn-p" type="button" style="padding:9px 16px;font-size:13px;" onclick="openClassDialog('new')"><i class="ti ti-users-plus"></i> Nová trieda</button>
       ${d.cls?`<button class="btn-s" type="button" onclick="openClassDialog('edit')"><i class="ti ti-edit"></i> Upraviť zoznam</button>`:''}
-      ${d.cls&&d.cls.id!==d.activeId?`<button class="btn-s" type="button" onclick="setActiveClass()"><i class="ti ti-check"></i> Nastaviť ako aktívnu</button>`:''}
+      ${d.cls?`<span class="badge bs" style="font-size:12px;padding:6px 10px;">Kód triedy: <strong style="letter-spacing:.08em;">${esc(d.cls.code||'')}</strong></span><button class="btn-s" type="button" onclick="copyClassLink()"><i class="ti ti-link"></i> Kopírovať odkaz</button><button class="btn-s" type="button" onclick="newClassCode()"><i class="ti ti-refresh"></i> Nový kód</button>`:''}
       ${d.cls?`<button class="btn-s" type="button" onclick="exportCsv()"><i class="ti ti-file-spreadsheet"></i> Export do CSV</button>`:''}
       <button class="btn-s" type="button" onclick="teacherLogout()"><i class="ti ti-logout"></i> Odhlásiť</button>
     </div>
@@ -1230,6 +1260,11 @@ async function deleteClassDialog(){
   catch(e){alert(e.message);}
 }
 
+function copyClassLink(){const u=location.origin+'/?trieda='+T.data.cls.code;try{navigator.clipboard.writeText(u);alert('Odkaz skopírovaný:\n'+u);}catch(e){prompt('Skopíruj odkaz:',u);}}
+async function newClassCode(){
+  if(!confirm('Vytvoriť nový kód? Starý kód prestane fungovať a žiaci zadajú nový.'))return;
+  try{await tApi('newCode',{classId:T.data.cls.id});await loadTeacher(T.data.cls.id);}catch(e){T.err=String(e.message||e);renderTeacher();}
+}
 async function setActiveClass(){
   try{await tApi('setActive',{classId:T.data.cls.id});await loadTeacher();}
   catch(e){alert(e.message);}

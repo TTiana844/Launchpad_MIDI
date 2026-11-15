@@ -27,6 +27,7 @@ Insta360 Lab a AKAI APC Key 25.
 - **Trieda a žiaci:** učiteľ vloží zoznam mien (max. 40) a tým vytvorí triedu. Žiaci si pri
   odovzdávaní vyberú meno zo zoznamu — nepíšu ho, preto sa mená nerozchádzajú. Tímy
   (cvičenia 2–4 členov s rolami) sa tiež skladajú z mien zo zoznamu.
+- **Kód triedy:** každá trieda má 5-znakový kód (učiteľský prehľad → Kód triedy, tlačidlá *Kopírovať odkaz* a *Nový kód*). Žiak zadá kód alebo otvorí odkaz `…/?trieda=KÓD` a uvidí len zoznam svojej triedy; kód si prehliadač zapamätá. Server odovzdanie bez platného kódu neprijme. Staršie triedy dostanú kód automaticky pri prvom otvorení učiteľského prehľadu.
 - **Jedno odovzdanie = jedno cvičenie pre jedného žiaka alebo pre celý tím.** Tímové odovzdanie
   sa započíta každému členovi; odovzdať ho stačí jednému.
 - **Hodnotenie ukladá server**, nie prehliadač žiaka. Žiak nič nesťahuje ani neposiela a nemá
